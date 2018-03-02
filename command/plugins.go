@@ -20,6 +20,10 @@ import (
 	"github.com/kardianos/osext"
 )
 
+func init() {
+	os.Setenv(tfplugin.TerraformPluginProtocol, tfplugin.TerraformProtoGRPC)
+}
+
 // multiVersionProviderResolver is an implementation of
 // terraform.ResourceProviderResolver that matches the given version constraints
 // against a set of versioned provider plugins to find the newest version of

@@ -1,6 +1,8 @@
 package plugin
 
 import (
+	"os"
+
 	"github.com/hashicorp/go-plugin"
 	"github.com/hashicorp/terraform/terraform"
 )
@@ -10,6 +12,14 @@ import (
 const (
 	ProviderPluginName    = "provider"
 	ProvisionerPluginName = "provisioner"
+)
+
+const (
+	// TerraformPLuginProtocol is an environment variable used to indicate the
+	// protocol being requested by the client. The only valid value for this is
+	// TerraformProtoGRPC
+	TerraformPluginProtocol = "TERRAFORM_PLUGIN_PROTOCOL"
+	TerraformProtoGRPC      = "grpc"
 )
 
 // Handshake is the HandshakeConfig used to configure clients and servers.
@@ -38,11 +48,17 @@ type ServeOpts struct {
 // Serve serves a plugin. This function never returns and should be the final
 // function called in the main function of the plugin.
 func Serve(opts *ServeOpts) {
-	plugin.Serve(&plugin.ServeConfig{
-		HandshakeConfig: Handshake,
-		Plugins:         pluginMap(opts),
-		GRPCServer:      plugin.DefaultGRPCServer,
-	})
+	switch os.Getenv(TerraformPluginProtocol) {
+	case TerraformProtoGRPC:
+		plugin.Serve(&plugin.ServeConfig{
+			HandshakeConfig: Handshake,
+			Plugins:         pluginMap(opts),
+			GRPCServer:      plugin.DefaultGRPCServer,
+		})
+	default:
+		panic("protocol not supported")
+	}
+
 }
 
 // pluginMap returns the map[string]plugin.Plugin to use for configuring a plugin
