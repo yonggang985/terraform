@@ -21,6 +21,8 @@ type ModuleCall struct {
 	Count   hcl.Expression
 	ForEach hcl.Expression
 
+	// TODO: Implement "providers" map
+
 	DependsOn []hcl.Traversal
 
 	DeclRange hcl.Range

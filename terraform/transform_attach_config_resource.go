@@ -4,28 +4,28 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/hashicorp/terraform/config"
-	"github.com/hashicorp/terraform/config/module"
+	"github.com/hashicorp/terraform/addrs"
+	"github.com/hashicorp/terraform/configs"
 )
 
 // GraphNodeAttachResourceConfig is an interface that must be implemented by nodes
 // that want resource configurations attached.
 type GraphNodeAttachResourceConfig interface {
 	// ResourceAddr is the address to the resource
-	ResourceAddr() *ResourceAddress
+	ResourceAddr() *addrs.AbsResource
 
 	// Sets the configuration
-	AttachResourceConfig(*config.Resource)
+	AttachResourceConfig(*configs.Resource)
 }
 
 // AttachResourceConfigTransformer goes through the graph and attaches
-// resource configuration structures to nodes that implement the interfaces
-// above.
+// resource configuration structures to nodes that implement
+// GraphNodeAttachManagedResourceConfig or GraphNodeAttachDataResourceConfig.
 //
 // The attached configuration structures are directly from the configuration.
 // If they're going to be modified, a copy should be made.
 type AttachResourceConfigTransformer struct {
-	Module *module.Tree // Module is the root module for the config
+	Config *configs.Config // Config is the root node in the config tree
 }
 
 func (t *AttachResourceConfigTransformer) Transform(g *Graph) error {

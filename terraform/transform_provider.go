@@ -1,22 +1,22 @@
 package terraform
 
 import (
-	"errors"
 	"fmt"
 	"log"
 	"strings"
 
+	"github.com/hashicorp/terraform/addrs"
+	"github.com/hashicorp/hcl2/hcl"
 	"github.com/hashicorp/go-multierror"
-	"github.com/hashicorp/terraform/config"
-	"github.com/hashicorp/terraform/config/module"
+	"github.com/hashicorp/terraform/configs"
 	"github.com/hashicorp/terraform/dag"
 )
 
-func TransformProviders(providers []string, concrete ConcreteProviderNodeFunc, mod *module.Tree) GraphTransformer {
+func TransformProviders(providers []string, concrete ConcreteProviderNodeFunc, config *configs.Config) GraphTransformer {
 	return GraphTransformMulti(
 		// Add providers from the config
 		&ProviderConfigTransformer{
-			Module:    mod,
+			Config:    config,
 			Providers: providers,
 			Concrete:  concrete,
 		},
@@ -36,10 +36,14 @@ func TransformProviders(providers []string, concrete ConcreteProviderNodeFunc, m
 
 // GraphNodeProvider is an interface that nodes that can be a provider
 // must implement.
-// ProviderName returns the name of the provider this satisfies.
+//
+// ProviderAddr returns the address of the provider configuration this
+// satisfies, which is relative to the path returned by method Path().
+//
 // Name returns the full name of the provider in the config.
 type GraphNodeProvider interface {
-	ProviderName() string
+	GraphNodeSubPath
+	ProviderAddr() addrs.AbsProviderConfig
 	Name() string
 }
 
@@ -47,17 +51,23 @@ type GraphNodeProvider interface {
 // provider must implement. The CloseProviderName returned is the name of
 // the provider they satisfy.
 type GraphNodeCloseProvider interface {
-	CloseProviderName() string
+	GraphNodeSubPath
+	CloseProviderAddr() addrs.AbsProviderConfig
 }
 
 // GraphNodeProviderConsumer is an interface that nodes that require
-// a provider must implement. ProvidedBy must return the name of the provider
-// to use. This may be a provider by type, type.alias or a fully resolved
-// provider name
+// a provider must implement. ProvidedBy must return the address of the provider
+// to use, which will be resolved to a configuration either in the same module
+// or in an ancestor module, with the resulting absolute address passed to
+// SetProvider.
 type GraphNodeProviderConsumer interface {
-	ProvidedBy() string
+	// ProvidedBy returns the address of the provider configuration the node
+	// refers to. If the returned "exact" value is true, this address will
+	// be taken exactly. If "exact" is false, a provider configuration from
+	// an ancestor module may be selected instead.
+	ProvidedBy() (addr addrs.AbsProviderConfig, exact bool)
 	// Set the resolved provider address for this resource.
-	SetProvider(string)
+	SetProvider(addrs.AbsProviderConfig)
 }
 
 // ProviderTransformer is a GraphTransformer that maps resources to
@@ -71,9 +81,9 @@ func (t *ProviderTransformer) Transform(g *Graph) error {
 	m := providerVertexMap(g)
 	for _, v := range g.Vertices() {
 		if pv, ok := v.(GraphNodeProviderConsumer); ok {
-			p := pv.ProvidedBy()
+			p, exact := pv.ProvidedBy()
 
-			key := providerMapKey(p, pv)
+			key := p.String()
 			target := m[key]
 
 			sp, ok := pv.(GraphNodeSubPath)
@@ -85,17 +95,15 @@ func (t *ProviderTransformer) Transform(g *Graph) error {
 				break
 			}
 
-			// if we don't have a provider at this level, walk up the path looking for one
-			for i := 1; target == nil; i++ {
-				path := normalizeModulePath(sp.Path())
-				if len(path) < i {
-					break
-				}
-
-				key = ResolveProviderName(p, path[:len(path)-i])
-				target = m[key]
-				if target != nil {
-					break
+			// if we don't have a provider at this level, walk up the path looking for one,
+			// unless we were told to be exact.
+			if !exact {
+				for pp, ok := p.Inherited(); ok; pp, ok = pp.Inherited() {
+					key := pp.String()
+					target = m[key]
+					if target != nil {
+						break
+					}
 				}
 			}
 
@@ -111,11 +119,11 @@ func (t *ProviderTransformer) Transform(g *Graph) error {
 			if p, ok := target.(*graphNodeProxyProvider); ok {
 				g.Remove(p)
 				target = p.Target()
-				key = target.(GraphNodeProvider).Name()
+				key = target.(GraphNodeProvider).ProviderAddr().String()
 			}
 
 			log.Printf("[DEBUG] resource %s using provider %s", dag.VertexName(pv), key)
-			pv.SetProvider(key)
+			pv.SetProvider(target.ProviderAddr())
 			g.Connect(dag.BasicEdge(v, target))
 		}
 	}
@@ -136,15 +144,16 @@ func (t *CloseProviderTransformer) Transform(g *Graph) error {
 
 	for _, v := range pm {
 		p := v.(GraphNodeProvider)
+		key := p.ProviderAddr().String()
 
 		// get the close provider of this type if we alread created it
-		closer := cpm[p.Name()]
+		closer := cpm[key]
 
 		if closer == nil {
 			// create a closer for this provider type
-			closer = &graphNodeCloseProvider{ProviderNameValue: p.Name()}
+			closer = &graphNodeCloseProvider{Addr: p.ProviderAddr()}
 			g.Add(closer)
-			cpm[p.Name()] = closer
+			cpm[key] = closer
 		}
 
 		// Close node depends on the provider itself
@@ -192,13 +201,9 @@ func (t *MissingProviderTransformer) Transform(g *Graph) error {
 			continue
 		}
 
-		p := pv.ProvidedBy()
-		// this may be the resolved provider from the state, so we need to get
-		// the base provider name.
-		parts := strings.SplitAfter(p, "provider.")
-		p = parts[len(parts)-1]
-
-		key := ResolveProviderName(p, nil)
+		p, _ := pv.ProvidedBy()
+		configAddr := p.ProviderConfig
+		key := configAddr.String()
 		provider := m[key]
 
 		// we already have it
@@ -207,19 +212,20 @@ func (t *MissingProviderTransformer) Transform(g *Graph) error {
 		}
 
 		// we don't implicitly create aliased providers
-		if strings.Contains(p, ".") {
-			log.Println("[DEBUG] not adding missing provider alias:", p)
+		if configAddr.Alias != "" {
+			log.Println("[DEBUG] not adding implicit aliased config for ", p.String())
 			continue
 		}
 
-		log.Println("[DEBUG] adding missing provider:", p)
+		log.Println("[DEBUG] adding implicit configuration for ", p.String())
 
-		// create the misisng top-level provider
+		// create the missing top-level provider
 		provider = t.Concrete(&NodeAbstractProvider{
-			NameValue: p,
-		}).(dag.Vertex)
+			Addr: p,
+		}).(GraphNodeProvider)
 
-		m[key] = g.Add(provider)
+		g.Add(provider)
+		m[key] = provider
 	}
 
 	return err
@@ -237,26 +243,26 @@ func (t *ParentProviderTransformer) Transform(g *Graph) error {
 	for _, v := range g.Vertices() {
 		// Only care about providers
 		pn, ok := v.(GraphNodeProvider)
-		if !ok || pn.ProviderName() == "" {
+		if !ok {
 			continue
 		}
 
-		// Also require a subpath, if there is no subpath then we
-		// can't have a parent.
-		if pn, ok := v.(GraphNodeSubPath); ok {
-			if len(normalizeModulePath(pn.Path())) <= 1 {
-				continue
-			}
+		// Also require non-empty path, since otherwise we're in the root
+		// module and so cannot have a parent.
+		if len(pn.Path()) <= 1 {
+			continue
 		}
 
 		// this provider may be disabled, but we can only get it's name from
 		// the ProviderName string
-		name := ResolveProviderName(strings.SplitN(pn.ProviderName(), " ", 2)[0], nil)
-		parent := pm[name]
-		if parent != nil {
-			g.Connect(dag.BasicEdge(v, parent))
+		addr := pn.ProviderAddr()
+		parentAddr, ok := addr.Inherited()
+		if ok {
+			parent := pm[parentAddr.String()]
+			if parent != nil {
+				g.Connect(dag.BasicEdge(v, parent))
+			}
 		}
-
 	}
 	return nil
 }
@@ -271,7 +277,7 @@ func (t *PruneProviderTransformer) Transform(g *Graph) error {
 	for _, v := range g.Vertices() {
 		// We only care about providers
 		pn, ok := v.(GraphNodeProvider)
-		if !ok || pn.ProviderName() == "" {
+		if !ok {
 			continue
 		}
 
@@ -291,40 +297,24 @@ func (t *PruneProviderTransformer) Transform(g *Graph) error {
 	return nil
 }
 
-// providerMapKey is a helper that gives us the key to use for the
-// maps returned by things such as providerVertexMap.
-func providerMapKey(k string, v dag.Vertex) string {
-	if strings.Contains(k, "provider.") {
-		// this is already resolved
-		return k
-	}
-
-	// we create a dummy provider to
-	var path []string
-	if sp, ok := v.(GraphNodeSubPath); ok {
-		path = normalizeModulePath(sp.Path())
-	}
-	return ResolveProviderName(k, path)
-}
-
-func providerVertexMap(g *Graph) map[string]dag.Vertex {
-	m := make(map[string]dag.Vertex)
+func providerVertexMap(g *Graph) map[string]GraphNodeProvider {
+	m := make(map[string]GraphNodeProvider)
 	for _, v := range g.Vertices() {
 		if pv, ok := v.(GraphNodeProvider); ok {
-			// TODO:  The Name may have meta info, like " (disabled)"
-			name := strings.SplitN(pv.Name(), " ", 2)[0]
-			m[name] = v
+			addr := pv.ProviderAddr()
+			m[addr.String()] = pv
 		}
 	}
 
 	return m
 }
 
-func closeProviderVertexMap(g *Graph) map[string]dag.Vertex {
-	m := make(map[string]dag.Vertex)
+func closeProviderVertexMap(g *Graph) map[string]GraphNodeCloseProvider {
+	m := make(map[string]GraphNodeCloseProvider)
 	for _, v := range g.Vertices() {
 		if pv, ok := v.(GraphNodeCloseProvider); ok {
-			m[pv.CloseProviderName()] = v
+			addr := pv.CloseProviderAddr()
+			m[addr.String()] = pv
 		}
 	}
 
@@ -332,16 +322,25 @@ func closeProviderVertexMap(g *Graph) map[string]dag.Vertex {
 }
 
 type graphNodeCloseProvider struct {
-	ProviderNameValue string
+	Addr addrs.AbsProviderConfig
 }
 
+var (
+	_ GraphNodeCloseProvider = (*graphNodeCloseProvider)(nil)
+)
+
 func (n *graphNodeCloseProvider) Name() string {
-	return n.ProviderNameValue + " (close)"
+	return n.Addr.String() + " (close)"
+}
+
+// GraphNodeSubPath impl.
+func (n *graphNodeCloseProvider) Path() addrs.ModuleInstance {
+	return n.Addr.Module
 }
 
 // GraphNodeEvalable impl.
 func (n *graphNodeCloseProvider) EvalTree() EvalNode {
-	return CloseProviderEvalTree(n.ProviderNameValue)
+	return CloseProviderEvalTree(n.Addr)
 }
 
 // GraphNodeDependable impl.
@@ -349,8 +348,8 @@ func (n *graphNodeCloseProvider) DependableName() []string {
 	return []string{n.Name()}
 }
 
-func (n *graphNodeCloseProvider) CloseProviderName() string {
-	return n.ProviderNameValue
+func (n *graphNodeCloseProvider) CloseProviderAddr() addrs.AbsProviderConfig {
+	return n.Addr
 }
 
 // GraphNodeDotter impl.
@@ -380,17 +379,22 @@ func (n *graphNodeCloseProvider) RemoveIfNotTargeted() bool {
 // configurations, and are removed after all the resources have been connected
 // to their providers.
 type graphNodeProxyProvider struct {
+	addr addrs.AbsProviderConfig
 	nameValue string
 	path      []string
 	target    GraphNodeProvider
 }
 
-func (n *graphNodeProxyProvider) ProviderName() string {
-	return n.Target().ProviderName()
+func (n *graphNodeProxyProvider) ProviderAddr() addrs.AbsProviderConfig {
+	return n.addr
+}
+
+func (n *graphNodeProxyProvider) Path() addrs.ModuleInstance {
+	return n.addr.Module
 }
 
 func (n *graphNodeProxyProvider) Name() string {
-	return ResolveProviderName(n.nameValue, n.path)
+	return n.addr.String()
 }
 
 // find the concrete provider instance
@@ -415,26 +419,21 @@ type ProviderConfigTransformer struct {
 	// record providers that can be overriden with a proxy
 	proxiable map[string]bool
 
-	// Module is the module to add resources from.
-	Module *module.Tree
+	// Config is the root node of the configuration tree to add providers from.
+	Config *configs.Config
 }
 
 func (t *ProviderConfigTransformer) Transform(g *Graph) error {
-	// If no module is given, we don't do anything
-	if t.Module == nil {
+	// If no configuration is given, we don't do anything
+	if t.Config == nil {
 		return nil
-	}
-
-	// If the module isn't loaded, that is simply an error
-	if !t.Module.Loaded() {
-		return errors.New("module must be loaded for ProviderConfigTransformer")
 	}
 
 	t.providers = make(map[string]GraphNodeProvider)
 	t.proxiable = make(map[string]bool)
 
 	// Start the transformation process
-	if err := t.transform(g, t.Module); err != nil {
+	if err := t.transform(g, t.Config); err != nil {
 		return err
 	}
 
@@ -442,80 +441,92 @@ func (t *ProviderConfigTransformer) Transform(g *Graph) error {
 	return t.attachProviderConfigs(g)
 }
 
-func (t *ProviderConfigTransformer) transform(g *Graph, m *module.Tree) error {
+func (t *ProviderConfigTransformer) transform(g *Graph, c *configs.Config) error {
 	// If no config, do nothing
-	if m == nil {
+	if c == nil {
 		return nil
 	}
 
 	// Add our resources
-	if err := t.transformSingle(g, m); err != nil {
+	if err := t.transformSingle(g, c); err != nil {
 		return err
 	}
 
 	// Transform all the children.
-	for _, c := range m.Children() {
-		if err := t.transform(g, c); err != nil {
+	for _, cc := range c.Children {
+		if err := t.transform(g, cc); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (t *ProviderConfigTransformer) transformSingle(g *Graph, m *module.Tree) error {
-	log.Printf("[TRACE] ProviderConfigTransformer: Starting for path: %v", m.Path())
+func (t *ProviderConfigTransformer) transformSingle(g *Graph, c *configs.Config) error {
+	log.Printf("[TRACE] ProviderConfigTransformer: Starting for module %q", c.Path.String())
 
-	// Get the configuration for this module
-	conf := m.Config()
+	// Get the module associated with this configuration tree node
+	mod := c.Module
+	staticPath := c.Path
 
-	// Build the path we're at
-	path := m.Path()
-	if len(path) > 0 {
-		path = append([]string{RootModuleName}, path...)
+	// We actually need a dynamic module path here, but we've not yet updated
+	// our graph builders enough to support expansion of module calls with
+	// "count" and "for_each" set, so for now we'll shim this by converting to
+	// a dynamic path with no keys. At the time of writing this is the only
+	// possible kind of dynamic path anyway.
+	path := make(addrs.ModuleInstance, len(staticPath))
+	for i, name := range staticPath {
+		path[i] = addrs.ModuleInstanceStep{
+			Name: name,
+		}
 	}
 
 	// add all providers from the configuration
-	for _, p := range conf.ProviderConfigs {
+	for _, p := range mod.ProviderConfigs {
 		name := p.Name
-		if p.Alias != "" {
-			name += "." + p.Alias
-		}
+		relAddr := p.Addr()
+		addr := relAddr.Absolute(path)
 
 		v := t.Concrete(&NodeAbstractProvider{
-			NameValue: name,
-			PathValue: path,
+			Addr: addr,
 		})
 
 		// Add it to the graph
 		g.Add(v)
-		fullName := ResolveProviderName(name, path)
-		t.providers[fullName] = v.(GraphNodeProvider)
-		t.proxiable[fullName] = len(p.RawConfig.RawMap()) == 0
+		key := addr.String()
+		t.providers[key] = v.(GraphNodeProvider)
+
+		// A provider configuration is "proxyable" if its configuration is
+		// entirely empty. This means it's standing in for a provider
+		// configuration that must be passed in from the parent module.
+		// We decide this by evaluating the config with an empty schema;
+		// if this succeeds, then we know there's nothing in the body.
+		_, diags := p.Config.Content(&hcl.BodySchema{})
+		t.proxiable[key] = !diags.HasErrors()
 	}
 
 	// Now replace the provider nodes with proxy nodes if a provider was being
 	// passed in, and create implicit proxies if there was no config. Any extra
 	// proxies will be removed in the prune step.
-	return t.addProxyProviders(g, m)
+	return t.addProxyProviders(g, c)
 }
 
-func (t *ProviderConfigTransformer) addProxyProviders(g *Graph, m *module.Tree) error {
-	path := m.Path()
+func (t *ProviderConfigTransformer) addProxyProviders(g *Graph, c *configs.Config) error {
+	path := c.Path
 
 	// can't add proxies at the root
 	if len(path) == 0 {
 		return nil
 	}
 
-	parentPath := path[:len(path)-1]
-	parent := t.Module.Child(parentPath)
+	parentPath, callName := path[:len(path)-1], path[len(path)-1]
+	parent := c.Descendent(parentPath)
 	if parent == nil {
 		return nil
 	}
 
-	var parentCfg *config.Module
-	for _, mod := range parent.Config().Modules {
-		if mod.Name == m.Name() {
+	var parentCfg *configs.ModuleCall
+	for name, mod := range parent.Module.ModuleCalls {
+		if name == callName {
 			parentCfg = mod
 			break
 		}
@@ -528,7 +539,7 @@ func (t *ProviderConfigTransformer) addProxyProviders(g *Graph, m *module.Tree) 
 
 	// Go through all the providers the parent is passing in, and add proxies to
 	// the parent provider nodes.
-	for name, parentName := range parentCfg.Providers {
+	for name, parentName := range parentCfg.ProviderConfigs {
 		fullName := ResolveProviderName(name, path)
 		fullParentName := ResolveProviderName(parentName, parentPath)
 
@@ -575,18 +586,18 @@ func (t *ProviderConfigTransformer) attachProviderConfigs(g *Graph) error {
 		}
 
 		// Determine what we're looking for
-		path := normalizeModulePath(apn.Path())[1:]
+		path := apn.Path()
 		name := apn.ProviderName()
 		log.Printf("[TRACE] Attach provider request: %#v %s", path, name)
 
 		// Get the configuration.
-		tree := t.Module.Child(path)
-		if tree == nil {
+		mc := t.Config.DescendentForInstance(path)
+		if mc == nil {
 			continue
 		}
 
 		// Go through the provider configs to find the matching config
-		for _, p := range tree.Config().ProviderConfigs {
+		for _, p := range mc.Module.Providers {
 			// Build the name, which is "name.alias" if an alias exists
 			current := p.Name
 			if p.Alias != "" {

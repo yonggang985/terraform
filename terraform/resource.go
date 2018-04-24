@@ -7,9 +7,13 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/hashicorp/terraform/config/configschema"
+	"github.com/hashicorp/terraform/config/hcl2shim"
+
 	"github.com/hashicorp/terraform/config"
 	"github.com/mitchellh/copystructure"
 	"github.com/mitchellh/reflectwalk"
+	"github.com/zclconf/go-cty/cty"
 )
 
 // ResourceProvisionerConfig is used to pair a provisioner
@@ -137,9 +141,9 @@ func (i *InstanceInfo) uniqueId() string {
 	return prefix
 }
 
-// ResourceConfig holds the configuration given for a resource. This is
-// done instead of a raw `map[string]interface{}` type so that rich
-// methods can be added to it to make dealing with it easier.
+// ResourceConfig is a legacy type that was formerly used to represent
+// interpolatable configuration blocks. It is now only used to shim to old
+// APIs that still use this type, via NewResourceConfigShimmed.
 type ResourceConfig struct {
 	ComputedKeys []string
 	Raw          map[string]interface{}
@@ -153,6 +157,97 @@ func NewResourceConfig(c *config.RawConfig) *ResourceConfig {
 	result := &ResourceConfig{raw: c}
 	result.interpolateForce()
 	return result
+}
+
+// NewResourceConfigShimmed wraps a cty.Value of object type in a legacy
+// ResourceConfig object, so that it can be passed to older APIs that expect
+// this wrapping.
+//
+// The returned ResourceConfig is already interpolated and cannot be
+// re-interpolated. It is, therefore, useful only to functions that expect
+// an already-populated ResourceConfig which they then treat as read-only.
+//
+// If the given value is not of an object type that conforms to the given
+// schema then this function will panic.
+func NewResourceConfigShimmed(val cty.Value, schema *configschema.Block) *ResourceConfig {
+	if !val.Type().IsObjectType() {
+		panic(fmt.Errorf("NewResourceConfigShimmed given %#v; an object type is required", val.Type()))
+	}
+	ret := &ResourceConfig{}
+	legacyVal := hcl2shim.ConfigValueFromHCL2(val)
+	ret.Config = legacyVal.(map[string]interface{}) // guaranteed compatible because we require an object type
+	ret.Raw = ret.Config
+
+	// Now we need to walk through our structure and find any unknown values,
+	// producing the separate list ComputedKeys to represent these. We use the
+	// schema here so that we can preserve the expected invariant
+	// that an attribute is always either wholly known or wholly unknown, while
+	// a child block can be partially unknown.
+	ret.ComputedKeys = newResourceConfigShimmedComputedKeys(val, schema, "")
+
+	return ret
+}
+
+// newResourceConfigShimmedComputedKeys finds all of the unknown values in the
+// given object, which must conform to the given schema, returning them in
+// the format that's expected for ResourceConfig.ComputedKeys.
+func newResourceConfigShimmedComputedKeys(obj cty.Value, schema *configschema.Block, prefix string) []string {
+	var ret []string
+	ty := obj.Type()
+
+	for attrName, attrS := range schema.Attributes {
+		if !ty.HasAttribute(attrName) {
+			// Should never happen, but we'll tolerate it anyway
+			continue
+		}
+
+		attrVal := obj.GetAttr(attrName)
+		if !attrVal.IsWhollyKnown() {
+			ret = append(ret, prefix+attrName)
+		}
+	}
+
+	for typeName, blockS := range schema.BlockTypes {
+		if !ty.HasAttribute(typeName) {
+			// Should never happen, but we'll tolerate it anyway
+			continue
+		}
+
+		blockVal := obj.GetAttr(typeName)
+		switch blockS.Nesting {
+		case configschema.NestingSingle:
+			keys := newResourceConfigShimmedComputedKeys(blockVal, &blockS.Block, fmt.Sprintf("%s%s.", prefix, typeName))
+			ret = append(ret, keys...)
+		case configschema.NestingList, configschema.NestingSet:
+			// Producing computed keys items for sets is not really useful
+			// since they are not usefully addressable anyway, but we'll treat
+			// them like lists just so that ret.ComputedKeys accounts for them
+			// all. Our legacy system didn't support sets here anyway, so
+			// treating them as lists is the most accurate translation. Although
+			// set traversal isn't in any particular order, it is _stable_ as
+			// long as the list isn't mutated, and so we know we'll see the
+			// same order here as hcl2shim.ConfigValueFromHCL2 would've seen
+			// inside NewResourceConfigShimmed above.
+			i := 0
+			for it := blockVal.ElementIterator(); it.Next(); i++ {
+				_, subVal := it.Element()
+				subPrefix := fmt.Sprintf("%s%d.", prefix, i)
+				keys := newResourceConfigShimmedComputedKeys(subVal, &blockS.Block, subPrefix)
+			}
+		case configschema.NestingMap:
+			for it := blockVal.ElementIterator(); it.Next(); {
+				subK, subVal := it.Element()
+				subPrefix := fmt.Sprintf("%s%s.", prefix, subK.AsString())
+				keys := newResourceConfigShimmedComputedKeys(subVal, &blockS.Block, subPrefix)
+				ret = append(ret, keys...)
+			}
+		default:
+			// Should never happen, since the above is exhaustive.
+			panic(fmt.Errorf("unsupported block nesting type %s", blockS.Nesting))
+		}
+	}
+
+	return ret
 }
 
 // DeepCopy performs a deep copy of the configuration. This makes it safe
@@ -374,6 +469,14 @@ func (c *ResourceConfig) get(
 // refactor is complete.
 func (c *ResourceConfig) interpolateForce() {
 	if c.raw == nil {
+		// If we don't have a lowercase "raw" but we _do_ have the uppercase
+		// Raw populated then this indicates that we're recieving a shim
+		// ResourceConfig created by NewResourceConfigShimmed, which is already
+		// fully evaluated and thus this function doesn't need to do anything.
+		if c.Raw != nil {
+			return
+		}
+
 		var err error
 		c.raw, err = config.NewRawConfig(make(map[string]interface{}))
 		if err != nil {

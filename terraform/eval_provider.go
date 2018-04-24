@@ -3,15 +3,18 @@ package terraform
 import (
 	"fmt"
 
-	"github.com/hashicorp/terraform/config"
+	"github.com/hashicorp/hcl2/hcl"
+	"github.com/hashicorp/terraform/addrs"
+	"github.com/hashicorp/terraform/configs"
+	"github.com/zclconf/go-cty/cty"
 )
 
 // EvalBuildProviderConfig outputs a *ResourceConfig that is properly
 // merged with parents and inputs on top of what is configured in the file.
 type EvalBuildProviderConfig struct {
-	Provider string
-	Config   **ResourceConfig
-	Output   **ResourceConfig
+	Provider addrs.ProviderConfig
+	Config   *hcl.Body
+	Output   *hcl.Body
 }
 
 func (n *EvalBuildProviderConfig) Eval(ctx EvalContext) (interface{}, error) {
@@ -24,13 +27,9 @@ func (n *EvalBuildProviderConfig) Eval(ctx EvalContext) (interface{}, error) {
 		// in particular it does *not* include attributes that had
 		// computed values at input time; those appear *only* in
 		// "cfg" here.
-		rc, err := config.NewRawConfig(input)
-		if err != nil {
-			return nil, err
-		}
 
-		merged := rc.Merge(cfg.raw)
-		cfg = NewResourceConfig(merged)
+		inputBody := configs.SynthBody("<input prompt>", input)
+		cfg = configs.MergeBodies(cfg, inputBody)
 	}
 
 	*n.Output = cfg
@@ -41,11 +40,11 @@ func (n *EvalBuildProviderConfig) Eval(ctx EvalContext) (interface{}, error) {
 // a provider that is already initialized and retrieved.
 type EvalConfigProvider struct {
 	Provider string
-	Config   **ResourceConfig
+	Config   *cty.Value
 }
 
 func (n *EvalConfigProvider) Eval(ctx EvalContext) (interface{}, error) {
-	return nil, ctx.ConfigureProvider(n.Provider, *n.Config)
+	return nil, ctx.ConfigureProvider(n.Provider, *n.Config).ErrWithWarnings()
 }
 
 // EvalInitProvider is an EvalNode implementation that initializes a provider

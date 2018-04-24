@@ -3,6 +3,13 @@ package terraform
 import (
 	"sync"
 
+	"github.com/hashicorp/terraform/addrs"
+
+	"github.com/hashicorp/hcl2/hcl"
+	"github.com/hashicorp/terraform/config/configschema"
+	"github.com/hashicorp/terraform/tfdiags"
+	"github.com/zclconf/go-cty/cty"
+
 	"github.com/hashicorp/terraform/config"
 )
 
@@ -37,17 +44,17 @@ type MockEvalContext struct {
 	CloseProviderProvider ResourceProvider
 
 	ProviderInputCalled bool
-	ProviderInputName   string
-	ProviderInputConfig map[string]interface{}
+	ProviderInputAddr   addrs.ProviderConfig
+	ProviderInputValues map[string]cty.Value
 
 	SetProviderInputCalled bool
-	SetProviderInputName   string
-	SetProviderInputConfig map[string]interface{}
+	SetProviderInputAddr   addrs.ProviderConfig
+	SetProviderInputValues map[string]cty.Value
 
 	ConfigureProviderCalled bool
 	ConfigureProviderName   string
-	ConfigureProviderConfig *ResourceConfig
-	ConfigureProviderError  error
+	ConfigureProviderConfig cty.Value
+	ConfigureProviderDiags  tfdiags.Diagnostics
 
 	InitProvisionerCalled      bool
 	InitProvisionerName        string
@@ -62,6 +69,21 @@ type MockEvalContext struct {
 	CloseProvisionerName        string
 	CloseProvisionerProvisioner ResourceProvisioner
 
+	EvaluateBlockCalled       bool
+	EvaluateBlockBody         hcl.Body
+	EvaluateBlockSchema       *configschema.Block
+	EvaluateBlockResource     *Resource
+	EvaluateBlockResult       cty.Value
+	EvaluateBlockExpandedBody hcl.Body
+	EvaluateBlockDiags        tfdiags.Diagnostics
+
+	EvaluateExprCalled   bool
+	EvaluateExprExpr     hcl.Expression
+	EvaluateExprWantType cty.Type
+	EvaluateExprResource *Resource
+	EvaluateExprResult   cty.Value
+	EvaluateExprDiags    tfdiags.Diagnostics
+
 	InterpolateCalled       bool
 	InterpolateConfig       *config.RawConfig
 	InterpolateResource     *Resource
@@ -75,11 +97,11 @@ type MockEvalContext struct {
 	InterpolateProviderError        error
 
 	PathCalled bool
-	PathPath   []string
+	PathPath   addrs.ModuleInstance
 
-	SetVariablesCalled    bool
-	SetVariablesModule    string
-	SetVariablesVariables map[string]interface{}
+	SetModuleCallArgumentsCalled bool
+	SetModuleCallArgumentsModule addrs.ModuleInstanceStep
+	SetModuleCallArgumentsValues map[string]cty.Value
 
 	DiffCalled bool
 	DiffDiff   *Diff
@@ -89,6 +111,9 @@ type MockEvalContext struct {
 	StateState  *State
 	StateLock   *sync.RWMutex
 }
+
+// MockEvalContext implements EvalContext
+var _ EvalContext = (*MockEvalContext)(nil)
 
 func (c *MockEvalContext) Stopped() <-chan struct{} {
 	c.StoppedCalled = true
@@ -135,23 +160,23 @@ func (c *MockEvalContext) CloseProvider(n string) error {
 	return nil
 }
 
-func (c *MockEvalContext) ConfigureProvider(n string, cfg *ResourceConfig) error {
+func (c *MockEvalContext) ConfigureProvider(n string, cfg cty.Value) tfdiags.Diagnostics {
 	c.ConfigureProviderCalled = true
 	c.ConfigureProviderName = n
 	c.ConfigureProviderConfig = cfg
-	return c.ConfigureProviderError
+	return c.ConfigureProviderDiags
 }
 
-func (c *MockEvalContext) ProviderInput(n string) map[string]interface{} {
+func (c *MockEvalContext) ProviderInput(addr addrs.ProviderConfig) map[string]cty.Value {
 	c.ProviderInputCalled = true
-	c.ProviderInputName = n
-	return c.ProviderInputConfig
+	c.ProviderInputAddr = addr
+	return c.ProviderInputValues
 }
 
-func (c *MockEvalContext) SetProviderInput(n string, cfg map[string]interface{}) {
+func (c *MockEvalContext) SetProviderInput(addr addrs.ProviderConfig, vals map[string]cty.Value) {
 	c.SetProviderInputCalled = true
-	c.SetProviderInputName = n
-	c.SetProviderInputConfig = cfg
+	c.SetProviderInputAddr = addr
+	c.SetProviderInputValues = vals
 }
 
 func (c *MockEvalContext) InitProvisioner(n string) (ResourceProvisioner, error) {
@@ -172,6 +197,22 @@ func (c *MockEvalContext) CloseProvisioner(n string) error {
 	return nil
 }
 
+func (c *MockEvalContext) EvaluateBlock(body hcl.Body, schema *configschema.Block, current *Resource) (cty.Value, hcl.Body, tfdiags.Diagnostics) {
+	c.EvaluateBlockCalled = true
+	c.EvaluateBlockBody = body
+	c.EvaluateBlockSchema = schema
+	c.EvaluateBlockResource = current
+	return c.EvaluateBlockResult, c.EvaluateBlockExpandedBody, c.EvaluateBlockDiags
+}
+
+func (c *MockEvalContext) EvaluateExpr(expr hcl.Expression, wantType cty.Type, current *Resource) (cty.Value, tfdiags.Diagnostics) {
+	c.EvaluateExprCalled = true
+	c.EvaluateExprExpr = expr
+	c.EvaluateExprWantType = wantType
+	c.EvaluateExprResource = current
+	return c.EvaluateExprResult, c.EvaluateExprDiags
+}
+
 func (c *MockEvalContext) Interpolate(
 	config *config.RawConfig, resource *Resource) (*ResourceConfig, error) {
 	c.InterpolateCalled = true
@@ -188,15 +229,15 @@ func (c *MockEvalContext) InterpolateProvider(
 	return c.InterpolateProviderConfigResult, c.InterpolateError
 }
 
-func (c *MockEvalContext) Path() []string {
+func (c *MockEvalContext) Path() addrs.ModuleInstance {
 	c.PathCalled = true
 	return c.PathPath
 }
 
-func (c *MockEvalContext) SetVariables(n string, vs map[string]interface{}) {
-	c.SetVariablesCalled = true
-	c.SetVariablesModule = n
-	c.SetVariablesVariables = vs
+func (c *MockEvalContext) SetModuleCallArguments(n addrs.ModuleInstanceStep, values map[string]cty.Value) {
+	c.SetModuleCallArgumentsCalled = true
+	c.SetModuleCallArgumentsModule = n
+	c.SetModuleCallArgumentsValues = values
 }
 
 func (c *MockEvalContext) Diff() (*Diff, *sync.RWMutex) {

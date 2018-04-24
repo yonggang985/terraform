@@ -3,7 +3,7 @@ package terraform
 import (
 	"log"
 
-	"github.com/hashicorp/terraform/config/module"
+	"github.com/hashicorp/terraform/configs"
 	"github.com/hashicorp/terraform/dag"
 )
 
@@ -40,7 +40,7 @@ type GraphNodeCreator interface {
 type DestroyEdgeTransformer struct {
 	// These are needed to properly build the graph of dependencies
 	// to determine what a destroy node depends on. Any of these can be nil.
-	Module *module.Tree
+	Config *configs.Config
 	State  *State
 }
 

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/hashicorp/terraform/config/module"
 	"github.com/hashicorp/terraform/dag"
 )
 
@@ -13,18 +12,9 @@ import (
 //
 // This transform is used for example by the ApplyGraphBuilder to ensure
 // that only resources that are being modified are represented in the graph.
-//
-// Module and State is still required for the DiffTransformer for annotations
-// since the Diff doesn't contain all the information required to build the
-// complete graph (such as create-before-destroy information). The graph
-// is built based on the diff first, though, ensuring that only resources
-// that are being modified are present in the graph.
 type DiffTransformer struct {
 	Concrete ConcreteResourceNodeFunc
-
-	Diff   *Diff
-	Module *module.Tree
-	State  *State
+	Diff     *Diff
 }
 
 func (t *DiffTransformer) Transform(g *Graph) error {

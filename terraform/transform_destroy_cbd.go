@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/hashicorp/terraform/config/module"
+	"github.com/hashicorp/terraform/configs"
 	"github.com/hashicorp/terraform/dag"
 )
 
@@ -38,7 +38,7 @@ type GraphNodeDestroyerCBD interface {
 type CBDEdgeTransformer struct {
 	// Module and State are only needed to look up dependencies in
 	// any way possible. Either can be nil if not availabile.
-	Module *module.Tree
+	Config *configs.Config
 	State  *State
 }
 

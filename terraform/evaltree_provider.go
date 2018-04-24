@@ -3,12 +3,12 @@ package terraform
 import (
 	"strings"
 
-	"github.com/hashicorp/terraform/config"
+	"github.com/hashicorp/terraform/configs"
 )
 
 // ProviderEvalTree returns the evaluation tree for initializing and
 // configuring providers.
-func ProviderEvalTree(n *NodeApplyableProvider, config *config.ProviderConfig) EvalNode {
+func ProviderEvalTree(n *NodeApplyableProvider, config *configs.Provider) EvalNode {
 	var provider ResourceProvider
 	var resourceConfig *ResourceConfig
 
@@ -28,10 +28,6 @@ func ProviderEvalTree(n *NodeApplyableProvider, config *config.ProviderConfig) E
 				&EvalGetProvider{
 					Name:   n.Name(),
 					Output: &provider,
-				},
-				&EvalInterpolateProvider{
-					Config: config,
-					Output: &resourceConfig,
 				},
 				&EvalBuildProviderConfig{
 					Provider: n.NameValue,
